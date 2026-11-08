@@ -80,6 +80,35 @@ ENTRIES="$BUILD/poc_entries.h"
 : > "$DECLS"
 : > "$ENTRIES"
 
+TAB="$(printf '\t')"
+RECORDS="$BUILD/poc_records.tsv"
+: > "$RECORDS"
+
+# Run order for kPocs: harmless/fast fuzzers first, kernel-panic-heavy last.
+# Equal ranks keep alphabetical order; unknown files default to the middle.
+poc_rank() {
+    case "$1" in
+        fuzzers/caf/harness.c|\
+        fuzzers/opack/http_parse_fuzz.c|\
+        fuzzers/opack/opack_extlen.c|\
+        fuzzers/opack/opack_fuzz.c|\
+        fuzzers/opack/opack_tagmap.c|\
+        fuzzers/opack/tlv8_fuzz.c|\
+        fuzzers/nfs/uc_zpfuzz.c|\
+        fuzzers/nfs/apfs_sel_fuzz.c|\
+        fuzzers/kflag/image4_struct_fuzz.c)
+            echo 1 ;;
+        fuzzers/io80211/apple80211_ioctl_fuzz.c|\
+        fuzzers/kflag/sc246_fuzz.c|\
+        fuzzers/kflag/apfs_xattr_fuzz.c)
+            echo 2 ;;
+        fuzzers/iokit/ios_iokit_fuzz.c|\
+        fuzzers/kflag/aio_fuzz.c)
+            echo 3 ;;
+        *) echo 2 ;;
+    esac
+}
+
 COUNT=0
 OBJS=()
 
@@ -100,8 +129,7 @@ while IFS= read -r src; do
     if "$CLANG" -target "$ARCH-apple-ios$MIN_IOS" -isysroot "$SDK" \
         -fobjc-arc -O1 -w -Dmain="$func" \
         -c "$COMPAT/$name.c" -o "$OBJ/$name.o" 2> "$OBJ/$name.err"; then
-        printf 'extern int %s(int, char **);\n' "$func" >> "$DECLS"
-        printf '    {"%s", %s},\n' "$rel" "$func" >> "$ENTRIES"
+        printf '%s\t%s\t%s\n' "$(poc_rank "$rel")" "$rel" "$func" >> "$RECORDS"
         OBJS+=("$OBJ/$name.o")
         COUNT=$((COUNT + 1))
         log "compiled $rel -> $func"
@@ -112,6 +140,13 @@ while IFS= read -r src; do
 done < <(find "$ROOT/fuzzers" -type f -name '*.c' | sort)
 
 [ "$COUNT" -gt 0 ] || die "no fuzzers compiled"
+
+log "ordering $COUNT fuzzers by run priority"
+LC_ALL=C sort -t "$TAB" -k1,1n -k2,2 "$RECORDS" > "$RECORDS.sorted"
+while IFS="$TAB" read -r _rank rel func; do
+    printf 'extern int %s(int, char **);\n' "$func" >> "$DECLS"
+    printf '    {"%s", %s},\n' "$rel" "$func" >> "$ENTRIES"
+done < "$RECORDS.sorted"
 
 log "generating $BUILD/poc_table.h ($COUNT entries)"
 {
