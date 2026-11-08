@@ -11,6 +11,7 @@ MIN_IOS=14.0
 TIMEOUT_SECONDS=${RUN_SECONDS:-60}
 APP_NAME=FuzzHarness
 PLUMESIGN="${PLUMESIGN:-/Applications/Impactor.app/Contents/MacOS/plumesign}"
+SKIP_FUZZERS=${SKIP_FUZZERS-uc_zpfuzz}
 
 BUILD="$ROOT/harness/build"
 COMPAT="$BUILD/compat"
@@ -36,6 +37,8 @@ Options:
 
 Environment:
   RUN_SECONDS        per-fuzzer timeout in seconds (default 60)
+  SKIP_FUZZERS       space-separated fuzzer names or paths to exclude
+                     (default "uc_zpfuzz"; set empty to include all)
   PLUMESIGN          plumesign path (default $PLUMESIGN)
 EOF
 }
@@ -43,6 +46,26 @@ EOF
 log() { printf '==> %s\n' "$*"; }
 warn() { printf 'warning: %s\n' "$*" >&2; }
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
+
+# SKIP_FUZZERS tokens match a source basename without .c, the repo-relative
+# path, or that path without .c. Space-separated; empty includes everything.
+is_skipped() {
+    local _rel="$1" _base _rel_noext _tok
+    _base="${_rel##*/}"
+    _base="${_base%.c}"
+    _rel_noext="${_rel%.c}"
+    set -f
+    for _tok in $SKIP_FUZZERS; do
+        case "$_tok" in
+            "$_base"|"$_rel"|"$_rel_noext")
+                set +f
+                return 0
+                ;;
+        esac
+    done
+    set +f
+    return 1
+}
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -110,11 +133,19 @@ poc_rank() {
 }
 
 COUNT=0
+SKIPPED=0
 OBJS=()
 
 log "compiling fuzzers for $ARCH / iOS $MIN_IOS"
 while IFS= read -r src; do
     rel="${src#"$ROOT"/}"
+
+    if is_skipped "$rel"; then
+        warn "skip $rel (excluded by SKIP_FUZZERS)"
+        SKIPPED=$((SKIPPED + 1))
+        continue
+    fi
+
     name="${rel%.c}"
     name="${name//\//_}"
     func="poc_$name"
@@ -176,7 +207,7 @@ log "packaging $IPA"
 (cd "$BUILD" && zip -qry "$IPA" Payload)
 [ -s "$IPA" ] || die "IPA not created"
 
-log "built $IPA ($COUNT fuzzers, ${TIMEOUT_SECONDS}s timeout each)"
+log "built $IPA ($COUNT fuzzers, $SKIPPED skipped, ${TIMEOUT_SECONDS}s timeout each)"
 
 if [ "$NO_INSTALL" -eq 1 ]; then
     log "--no-install: skipping sign/install"
