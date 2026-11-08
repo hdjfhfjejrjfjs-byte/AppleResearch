@@ -107,8 +107,10 @@ TAB="$(printf '\t')"
 RECORDS="$BUILD/poc_records.tsv"
 : > "$RECORDS"
 
-# Run order for kPocs: harmless/fast fuzzers first, kernel-panic-heavy last.
-# Equal ranks keep alphabetical order; unknown files default to the middle.
+# Run order for kPocs: harmless/fast fuzzers first, then io80211/sc246,
+# then the panic-heavy ios_iokit/aio, and apfs_xattr last (it idles on iOS
+# without /Volumes/SCRATCH). Equal ranks keep alphabetical order; unknown
+# files default to the middle.
 poc_rank() {
     case "$1" in
         fuzzers/caf/harness.c|\
@@ -122,12 +124,13 @@ poc_rank() {
         fuzzers/kflag/image4_struct_fuzz.c)
             echo 1 ;;
         fuzzers/io80211/apple80211_ioctl_fuzz.c|\
-        fuzzers/kflag/sc246_fuzz.c|\
-        fuzzers/kflag/apfs_xattr_fuzz.c)
+        fuzzers/kflag/sc246_fuzz.c)
             echo 2 ;;
         fuzzers/iokit/ios_iokit_fuzz.c|\
         fuzzers/kflag/aio_fuzz.c)
             echo 3 ;;
+        fuzzers/kflag/apfs_xattr_fuzz.c)
+            echo 4 ;;
         *) echo 2 ;;
     esac
 }
