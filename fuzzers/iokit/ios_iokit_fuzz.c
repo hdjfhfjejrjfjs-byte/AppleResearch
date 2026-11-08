@@ -13,7 +13,7 @@ static const char* SVCS[]={"IOSurfaceRootUserClient","AGXDeviceUserClient","Appl
 static volatile io_connect_t sh[16];
 static void* w(void* a){ long id=(long)a;
   for(;;){ int n=0; while(SVCS[n])n++; int si=arc4random()%n;
-    io_service_t s=IOServiceGetMatchingService(kIOMasterPortDefault,IOServiceMatching(SVCS[si]));
+    io_service_t s=IOServiceGetMatchingService(MACH_PORT_NULL,IOServiceMatching(SVCS[si]));
     if(s){ io_connect_t cn; if(IOServiceOpen(s,mach_task_self(),arc4random()%8,&cn)==0){ sh[id%16]=cn;
       for(int r=0;r<16;r++){ io_connect_t v=sh[arc4random()%16]; if(!v)continue;
         unsigned long long in[16],out[16]; unsigned int no=16; char si2[4096],so[4096]; size_t sol=4096;
