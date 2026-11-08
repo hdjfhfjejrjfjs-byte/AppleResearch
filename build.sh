@@ -194,10 +194,14 @@ if not found:
 PY
     )" || die "no USB device found"
 
+    DEVICE_COUNT="$(printf '%s\n' "$DEVICE_LINE" | wc -l | tr -d ' ')"
     FIRST_DEVICE="${DEVICE_LINE%%$'\n'*}"
-    DEVICE_ID="${FIRST_DEVICE#*$'\t'}"
-    [ -n "$DEVICE_ID" ] || die "could not read UDID from usbmuxd response"
-    log "usb device: $FIRST_DEVICE"
+    DEVICE_ID="${FIRST_DEVICE%%$'\t'*}"
+    [ -n "$DEVICE_ID" ] || die "could not read DeviceID from usbmuxd response"
+    if [ "$DEVICE_COUNT" -gt 1 ]; then
+        log "multiple USB devices found ($DEVICE_COUNT); using the first"
+    fi
+    log "usb device: $FIRST_DEVICE (DeviceID $DEVICE_ID)"
 fi
 
 SIGN_DIR="$(mktemp -d)"
