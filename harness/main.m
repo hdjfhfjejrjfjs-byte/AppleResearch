@@ -24,6 +24,7 @@
 static NSString *gStatePath;
 static NSString *gLogPath;
 static NSFileHandle *gLog;
+static int gLogFD = -1;          // captured before fork; no ObjC in the child
 static UITextView *gConsole;
 static _Atomic int gRunActive;   // 0 = idle; claimed before run_all is dispatched
 
@@ -103,12 +104,12 @@ static void run_all(void) {
             // The fuzzers are renamed mains; give them a valid argv[0] because
             // some (fuzzers/caf/harness.c) dereference it before checking argc.
             char *poc_argv[] = { (char *)kPocs[i].name, NULL };
-            // The descriptor survives fork and shares its append offset with the
-            // parent's handle, so fuzzer output lands in harness.log in order.
-            int logfd = gLog ? [gLog fileDescriptor] : -1;
-            if (logfd >= 0) {
-                dup2(logfd, STDOUT_FILENO);
-                dup2(logfd, STDERR_FILENO);
+            // gLogFD was captured before fork: messaging an object in a forked
+            // child of a multithreaded process can deadlock. The descriptor
+            // shares its append offset with the parent's handle.
+            if (gLogFD >= 0) {
+                dup2(gLogFD, STDOUT_FILENO);
+                dup2(gLogFD, STDERR_FILENO);
             }
             setvbuf(stdout, NULL, _IONBF, 0);
             int r = kPocs[i].func(1, poc_argv);
@@ -127,13 +128,19 @@ static void run_all(void) {
         for (;;) {
             if (waitpid(pid, &status, WNOHANG) == pid) break;
             if (time(NULL) - start >= POC_TIMEOUT_SECONDS) {
-                // kill() loses a race with a child that just exited; only report
-                // a timeout when the signal was actually delivered.
+                // kill() may lose the race with a child that just exited; the
+                // WTERMSIG check after the reap decides whether this was real.
                 if (kill(pid, SIGKILL) == 0) timed_out = 1;
                 while (waitpid(pid, &status, 0) < 0 && errno == EINTR) { }
                 break;
             }
             usleep(100 * 1000);
+        }
+
+        // kill() reports success for an already-dead child on Darwin; only a
+        // SIGKILL-terminated status proves the timeout actually fired.
+        if (timed_out && !(WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL)) {
+            timed_out = 0;
         }
 
         if (timed_out) {
@@ -233,6 +240,7 @@ int main(int argc, char *argv[]) {
         }
         gLog = [NSFileHandle fileHandleForWritingAtPath:gLogPath];
         [gLog seekToEndOfFile];
+        gLogFD = gLog ? [gLog fileDescriptor] : -1;
 
         return UIApplicationMain(argc, argv, nil, NSStringFromClass([HarnessAppDelegate class]));
     }
