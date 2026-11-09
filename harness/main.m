@@ -1,30 +1,35 @@
-// harness/main.m — runs every compiled fuzzer sequentially, once per launch.
-// Each fuzzer runs in a forked child with a hard timeout, so a user-space crash
-// or an infinite loop cannot stop the run. State persists across kernel panics:
-// the next launch resumes at the fuzzer that was running when the device died.
+// harness/main.m — runs every compiled fuzzer once per launch, each on its own
+// detached pthread.  The iOS sandbox rejects fork() from third-party apps
+// (EPERM), so process isolation is unavailable: a fuzzer that hangs cannot be
+// killed, it keeps fuzzing in the background after its timeout while the
+// runner advances to the next entry.
+//
+// Crash recovery is "advance first": the resume record is moved to the next
+// fuzzer BEFORE that fuzzer starts.  If it takes down user space (system crash
+// log) or the kernel (panic log), the next launch resumes after it and never
+// repeats it; the last START line in harness.log identifies the culprit.
+//
 // Results: Documents/harness.log + live on-screen console.
 
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
-#include <errno.h>
 #include <fcntl.h>
-#include <signal.h>
+#include <pthread.h>
 #include <stdatomic.h>
 #include <stdio.h>
-#include <sys/wait.h>
-#include <unistd.h>
+#include <stdlib.h>
 #include <time.h>
+#include <unistd.h>
 #include "poc_table.h"
 
 #ifndef POC_TIMEOUT_SECONDS
 #define POC_TIMEOUT_SECONDS 60
 #endif
-#define MAX_ATTEMPTS 2   // skip a fuzzer after this many launches die on it
 
 static NSString *gStatePath;
 static NSString *gLogPath;
 static NSFileHandle *gLog;
-static int gLogFD = -1;          // captured before fork; no ObjC in the child
+static int gLogFD = -1;          // stdout/stderr target, captured in main()
 static UITextView *gConsole;
 static _Atomic int gRunActive;   // 0 = idle; claimed before run_all is dispatched
 
@@ -74,12 +79,34 @@ static int run_begin(void) {
     return atomic_compare_exchange_strong(&gRunActive, &expected, 1);
 }
 
+// One entry per launched fuzzer.  The slot is heap-allocated and never reused:
+// a thread that outlives its timeout still owns its slot until it returns, and
+// a later Rerun must not alias it.
+struct RunSlot {
+    const char *name;
+    int (*func)(int, char **);
+    volatile int done;
+    int ret;
+};
+
+static void *run_slot(void *arg) {
+    struct RunSlot *slot = (struct RunSlot *)arg;
+    // The fuzzers are renamed mains; give them a valid argv[0] because some
+    // (fuzzers/caf/harness.c) dereference it before checking argc.
+    char *poc_argv[] = { (char *)slot->name, NULL };
+    slot->ret = slot->func(1, poc_argv);
+    __sync_synchronize();               // publish ret before done
+    slot->done = 1;
+    return NULL;
+}
+
 static void run_all(void) {
     int idx = 0, att = 0;
     load_state(&idx, &att);
+    (void)att;  // legacy attempts field: still parsed, no longer used
 
     if (idx >= POC_COUNT) {
-        log_line(@"=== ALL DONE — %d fuzzers completed on previous runs ===", POC_COUNT);
+        log_line(@"=== ALL DONE — %d fuzzers launched on previous runs ===", POC_COUNT);
         log_line(@"tap Rerun to start over");
         return;
     }
@@ -87,77 +114,68 @@ static void run_all(void) {
     log_line(@"=== FuzzHarness: %d fuzzers, resume at %d, timeout %ds each ===",
              POC_COUNT, idx + 1, POC_TIMEOUT_SECONDS);
 
+    int exited = 0, timed_out = 0, failed = 0;
+
     for (int i = idx; i < POC_COUNT; i++) {
-        if (i == idx && att >= MAX_ATTEMPTS) {
-            log_line(@"[%d/%d] %s — SKIPPED (%d attempts died on it)",
-                     i + 1, POC_COUNT, kPocs[i].name, att);
+        struct RunSlot *slot = calloc(1, sizeof(*slot));
+        if (slot == NULL) {
+            log_line(@"[%d/%d] %s — THREAD FAILED (out of memory)", i + 1, POC_COUNT, kPocs[i].name);
             save_state(i + 1, 0);
+            failed++;
             continue;
         }
-        if (i != idx) att = 0;
+        slot->name = kPocs[i].name;
+        slot->func = kPocs[i].func;
 
-        save_state(i, att + 1);
         log_line(@"[%d/%d] %s — START", i + 1, POC_COUNT, kPocs[i].name);
+        // Advance before launch: if this fuzzer crashes the app or panics the
+        // kernel, the next launch resumes at i + 1 and never repeats it.
+        save_state(i + 1, 0);
 
-        pid_t pid = fork();
-        if (pid == 0) {
-            // The fuzzers are renamed mains; give them a valid argv[0] because
-            // some (fuzzers/caf/harness.c) dereference it before checking argc.
-            char *poc_argv[] = { (char *)kPocs[i].name, NULL };
-            // gLogFD was captured before fork: messaging an object in a forked
-            // child of a multithreaded process can deadlock. The descriptor
-            // shares its append offset with the parent's handle.
-            if (gLogFD >= 0) {
-                dup2(gLogFD, STDOUT_FILENO);
-                dup2(gLogFD, STDERR_FILENO);
-            }
-            setvbuf(stdout, NULL, _IONBF, 0);
-            int r = kPocs[i].func(1, poc_argv);
-            fflush(NULL);
-            _exit(r);
-        }
-        if (pid < 0) {
-            log_line(@"[%d/%d] %s — FORK FAILED", i + 1, POC_COUNT, kPocs[i].name);
-            save_state(i + 1, 0);
+        pthread_t tid;
+        pthread_attr_t attr;
+        pthread_attr_init(&attr);
+        pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+        int rc = pthread_create(&tid, &attr, run_slot, slot);
+        pthread_attr_destroy(&attr);
+        if (rc != 0) {
+            log_line(@"[%d/%d] %s — THREAD FAILED (%d)", i + 1, POC_COUNT, kPocs[i].name, rc);
+            free(slot);
+            failed++;
             continue;
         }
 
-        int status = 0;
-        int timed_out = 0;
+        // Never join and never kill: a timed-out fuzzer keeps running in the
+        // background (that is the point) and keeps its slot.
+        int slot_timed_out = 0;
         time_t start = time(NULL);
-        for (;;) {
-            if (waitpid(pid, &status, WNOHANG) == pid) break;
+        while (!slot->done) {
             if (time(NULL) - start >= POC_TIMEOUT_SECONDS) {
-                // kill() may lose the race with a child that just exited; the
-                // WTERMSIG check after the reap decides whether this was real.
-                if (kill(pid, SIGKILL) == 0) timed_out = 1;
-                while (waitpid(pid, &status, 0) < 0 && errno == EINTR) { }
+                slot_timed_out = 1;
                 break;
             }
             usleep(100 * 1000);
         }
 
-        // kill() reports success for an already-dead child on Darwin; only a
-        // SIGKILL-terminated status proves the timeout actually fired.
-        if (timed_out && !(WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL)) {
-            timed_out = 0;
-        }
-
-        if (timed_out) {
-            log_line(@"[%d/%d] %s — TIMEOUT (%ds, killed)",
+        if (slot_timed_out) {
+            log_line(@"[%d/%d] %s — TIMEOUT (%ds) — 后台线程继续运行",
                      i + 1, POC_COUNT, kPocs[i].name, POC_TIMEOUT_SECONDS);
-        } else if (WIFSIGNALED(status)) {
-            log_line(@"[%d/%d] %s — CRASH signal %d (finding — check crash log)",
-                     i + 1, POC_COUNT, kPocs[i].name, WTERMSIG(status));
+            timed_out++;
         } else {
-            log_line(@"[%d/%d] %s — exit %d",
-                     i + 1, POC_COUNT, kPocs[i].name, WEXITSTATUS(status));
+            __sync_synchronize();       // pair with the writer before reading ret
+            log_line(@"[%d/%d] %s — exit %d", i + 1, POC_COUNT, kPocs[i].name, slot->ret);
+            free(slot);
+            exited++;
         }
-
-        save_state(i + 1, 0);
     }
 
-    log_line(@"=== ALL %d FUZZERS DONE ===", POC_COUNT);
+    if (failed == 0) {
+        log_line(@"=== ALL %d LAUNCHED — %d exited, %d timed out (running in background) ===",
+                 POC_COUNT, exited, timed_out);
+    } else {
+        log_line(@"=== ALL %d LAUNCHED — %d exited, %d timed out (running in background), %d failed to start ===",
+                 POC_COUNT, exited, timed_out, failed);
+    }
 }
 
 static void run_all_once(void) {
@@ -220,6 +238,8 @@ static void run_all_once(void) {
 
 @implementation HarnessAppDelegate
 - (BOOL)application:(UIApplication *)application didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
+    // Keep the device awake: auto-lock suspends the app and stops all fuzzing.
+    [UIApplication sharedApplication].idleTimerDisabled = YES;
     self.window = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
     self.window.rootViewController = [[HarnessVC alloc] init];
     [self.window makeKeyAndVisible];
@@ -241,6 +261,16 @@ int main(int argc, char *argv[]) {
         gLog = [NSFileHandle fileHandleForWritingAtPath:gLogPath];
         [gLog seekToEndOfFile];
         gLogFD = gLog ? [gLog fileDescriptor] : -1;
+
+        // One process-wide redirect before any fuzzer thread starts: fuzzer
+        // printf/fprintf and NSLog output land in Documents/harness.log (the
+        // threads inherit fds 1 and 2).  Unbuffered so a crash does not lose
+        // the last lines.
+        if (gLogFD >= 0) {
+            dup2(gLogFD, STDOUT_FILENO);
+            dup2(gLogFD, STDERR_FILENO);
+        }
+        setvbuf(stdout, NULL, _IONBF, 0);
 
         return UIApplicationMain(argc, argv, nil, NSStringFromClass([HarnessAppDelegate class]));
     }
